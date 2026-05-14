@@ -32,6 +32,10 @@ def test_train_bpe():
         special_tokens=["<|endoftext|>"],
     )
 
+    with open("test_merges.txt", "w") as f:
+        for merge in merges:
+            f.write(f"{merge[0]} {merge[1]}\n")
+
     # Path to the reference tokenizer vocab and merges
     reference_vocab_path = FIXTURES_PATH / "train-bpe-reference-vocab.json"
     reference_merges_path = FIXTURES_PATH / "train-bpe-reference-merges.txt"

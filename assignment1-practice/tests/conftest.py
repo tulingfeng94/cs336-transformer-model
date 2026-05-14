@@ -1,6 +1,7 @@
 import os
 import pickle
 from pathlib import Path
+from typing import Generic, TypeVar
 
 import numpy as np
 import pytest
@@ -12,13 +13,17 @@ class DEFAULT:
     pass
 
 
-def _canonicalize_array[A: (np.ndarray, Tensor)](arr: A) -> np.ndarray:
+# PEP 695-style generics require Python 3.12+; use TypeVar for 3.10+.
+_ArrayT = TypeVar("_ArrayT", np.ndarray, Tensor)
+
+
+def _canonicalize_array(arr: _ArrayT) -> np.ndarray:
     if isinstance(arr, Tensor):
         arr = arr.detach().cpu().numpy()
     return arr
 
 
-class NumpySnapshot[A: (np.ndarray, Tensor)]:
+class NumpySnapshot(Generic[_ArrayT]):
     """Snapshot testing utility for NumPy arrays using .npz format."""
 
     def __init__(
@@ -40,7 +45,7 @@ class NumpySnapshot[A: (np.ndarray, Tensor)]:
 
     def assert_match(
         self,
-        actual: A | dict[str, A],
+        actual: _ArrayT | dict[str, _ArrayT],
         rtol: float = 1e-4,
         atol: float = 1e-2,
         test_name: str | type[DEFAULT] = DEFAULT,
@@ -92,7 +97,7 @@ class NumpySnapshot[A: (np.ndarray, Tensor)]:
             )
 
 
-class Snapshot[A: (np.ndarray, Tensor)]:
+class Snapshot(Generic[_ArrayT]):
     def __init__(
         self,
         snapshot_dir: str = "tests/_snapshots",
@@ -112,7 +117,7 @@ class Snapshot[A: (np.ndarray, Tensor)]:
 
     def assert_match(
         self,
-        actual: A | dict[str, A],
+        actual: _ArrayT | dict[str, _ArrayT],
         test_name: str | type[DEFAULT] = DEFAULT,
         force_update: bool | type[DEFAULT] = DEFAULT,
     ):

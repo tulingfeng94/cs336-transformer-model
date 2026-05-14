@@ -178,6 +178,10 @@ def test_rmsnorm(numpy_snapshot, ts_state_dict, in_embeddings):
     reference_weights = state_dict["layers.1.ln1.weight"]
     d_model = reference_weights.shape[0]
 
+    print("reference_weights.shape: ", reference_weights.shape)
+    print("in_embeddings.shape: ", in_embeddings.shape) 
+    print("d_model: ", d_model)
+
     actual_output = run_rmsnorm(d_model=d_model, eps=1e-5, weights=reference_weights, in_features=in_embeddings)
 
     numpy_snapshot.assert_match(actual_output, atol=1e-4)
