@@ -123,8 +123,12 @@ def MultiheadSelfAttention(
     k = einops.rearrange(k, "... s (h d) -> ... h s d", h=num_heads, d=d_k)
     v = einops.rearrange(v, "... s (h d) -> ... h s d", h=num_heads, d=d_k)
     if rope is not None and token_positions is not None:
-        q = rope(q, token_positions)
-        k = rope(k, token_positions)
+        # q/k are (..., num_heads, seq, d_k); token_positions are (..., seq)
+        pos = token_positions
+        while pos.ndim < q.ndim - 1:
+            pos = pos.unsqueeze(-2)
+        q = rope(q, pos)
+        k = rope(k, pos)
     scores = einops.einsum(q, k, "... h q d, ... h k d -> ... h q k") / math.sqrt(d_k)
     if causal:
         q_len, k_len = scores.shape[-2], scores.shape[-1]
@@ -195,6 +199,90 @@ def _layer_weights(weights: dict[str, torch.Tensor], layer: int) -> dict[str, to
     return {k[len(prefix) :]: v for k, v in weights.items() if k.startswith(prefix)}
 
 
+def _init_matrix(param: torch.Tensor) -> None:
+    nn.init.kaiming_uniform_(param, a=5**0.5)
+
+
+class _RMSNormWeight(nn.Module):
+    def __init__(self, d_model: int, device=None, dtype=None):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, device=None, dtype=None):
+        super().__init__()
+        self.attn = nn.ModuleDict(
+            {
+                "q_proj": nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype),
+                "k_proj": nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype),
+                "v_proj": nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype),
+                "output_proj": nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype),
+            }
+        )
+        self.ln1 = _RMSNormWeight(d_model, device=device, dtype=dtype)
+        self.ffn = nn.ModuleDict(
+            {
+                "w1": nn.Linear(d_model, d_ff, bias=False, device=device, dtype=dtype),
+                "w2": nn.Linear(d_ff, d_model, bias=False, device=device, dtype=dtype),
+                "w3": nn.Linear(d_model, d_ff, bias=False, device=device, dtype=dtype),
+            }
+        )
+        self.ln2 = _RMSNormWeight(d_model, device=device, dtype=dtype)
+        for mod in (*self.attn.values(), *self.ffn.values()):
+            _init_matrix(mod.weight)
+
+    def state_dict(self, *args, **kwargs):
+        return super().state_dict(*args, **kwargs)
+
+
+class TransformerLM(nn.Module):
+    """Trainable LM whose ``state_dict`` keys match ``build_transformer_lm``."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+
+        self.token_embeddings = nn.Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.layers = nn.ModuleList(
+            TransformerBlock(d_model, num_heads, d_ff, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        )
+        self.ln_final = _RMSNormWeight(d_model, device=device, dtype=dtype)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False, device=device, dtype=dtype)
+        _init_matrix(self.lm_head.weight)
+
+    def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
+        return build_transformer_lm(
+            self.vocab_size,
+            self.context_length,
+            self.d_model,
+            self.num_layers,
+            self.num_heads,
+            self.d_ff,
+            self.rope_theta,
+            dict(self.named_parameters()),
+            in_indices,
+        )
+
+
 def build_transformer_lm(
     vocab_size: int,
     context_length: int,
@@ -210,6 +298,8 @@ def build_transformer_lm(
     tok = weights["token_embeddings.weight"]
     x = tok[in_indices.to(device=tok.device)]
 
+    # causal mask for the transformer block
+    # this is used to prevent the model from attending to future tokens and ensure that the model is autoregressive
     for layer in range(num_layers):
         x = build_transformer_block(
             d_model,
@@ -219,7 +309,7 @@ def build_transformer_lm(
             rope_theta,
             _layer_weights(weights, layer),
             x,
-            causal=False,
+            causal=True,
         )
 
     w_final = weights["ln_final.weight"]
@@ -324,5 +414,5 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "iteration": iteration,
     }
-    torch.save(checkpoint, sr
+    torch.save(checkpoint, src)
     

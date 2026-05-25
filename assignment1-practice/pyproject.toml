@@ -33,6 +33,15 @@ module-root = ""
 package = true
 python-preference = "managed"
 
+# Default PyPI torch is +cu130; pin cu126 to match driver CUDA 12.8.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "WARNING"

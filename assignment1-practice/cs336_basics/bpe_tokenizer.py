@@ -3,11 +3,20 @@ Byte-level BPE training aligned with GPT-2 / course reference tests.
 """
 from __future__ import annotations
 
+import argparse
+import json
+import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+import numpy as np
 import regex as re
 
 from tests.common import gpt2_bytes_to_unicode
+
+_MIN_LINES_FOR_PRETOKEN_MP = 1000
+_LINE_BATCH_SIZE = 8192
 
 # GPT-2 pretokenization pattern (handout / tiktoken-style)
 GPT2_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -222,3 +231,272 @@ def bpe_tokenizer_training(
     merges = train_bpe_fast(corpus, vocab_size, len(special_tokens))
     vocab = generate_vocab(merges, special_tokens)
     return vocab, merges
+
+
+def _bytes_to_gpt2_display(b: bytes) -> str:
+    b2u = gpt2_bytes_to_unicode()
+    return "".join(b2u[x] for x in b)
+
+
+def save_vocab_merges(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    vocab_path: str | os.PathLike,
+    merges_path: str | os.PathLike,
+) -> None:
+    """Save vocab/merges in GPT-2-style JSON + merges.txt (for ``Tokenizer.from_files``)."""
+    vocab_json = {_bytes_to_gpt2_display(token): idx for idx, token in vocab.items()}
+    Path(vocab_path).write_text(json.dumps(vocab_json), encoding="utf-8")
+    merge_lines = [
+        f"{_bytes_to_gpt2_display(left)} {_bytes_to_gpt2_display(right)}" for left, right in merges
+    ]
+    Path(merges_path).write_text("\n".join(merge_lines) + ("\n" if merge_lines else ""), encoding="utf-8")
+
+
+class BPETokenizer:
+    """Encode text with a trained BPE vocab + merge list from ``bpe_tokenizer_training``."""
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = list(special_tokens or [])
+        self.vocab_rank = {token: idx for idx, token in vocab.items()}
+        self.merge_rank = {pair: rank for rank, pair in enumerate(merges)}
+        self._special_ids = {
+            tok: self.vocab_rank[gpt2_symbols_to_raw_bytes(tok)] for tok in self.special_tokens
+        }
+        if not self.special_tokens:
+            raise ValueError("expected at least one special token")
+        self.eot_id = self._special_ids[self.special_tokens[0]]
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_path: str | os.PathLike,
+        merges_path: str | os.PathLike,
+        special_tokens: list[str] | None = None,
+    ) -> BPETokenizer:
+        from cs336_basics.tokenizer import Tokenizer
+
+        tok = Tokenizer.from_files(vocab_path, merges_path, special_tokens)
+        return cls(tok.vocab, tok.merges, tok.special_tokens)
+
+    def _merge_pre_token(self, pre_token: str) -> list[int]:
+        pre_token_bytes_list = [bytes([b]) for b in pre_token.encode("utf-8")]
+        while len(pre_token_bytes_list) > 1:
+            best_rank = float("inf")
+            best_idx = -1
+            for i in range(len(pre_token_bytes_list) - 1):
+                pair = (pre_token_bytes_list[i], pre_token_bytes_list[i + 1])
+                rank = self.merge_rank.get(pair, float("inf"))
+                if rank < best_rank:
+                    best_rank = rank
+                    best_idx = i
+            if best_idx == -1:
+                break
+            merged = pre_token_bytes_list[best_idx] + pre_token_bytes_list[best_idx + 1]
+            pre_token_bytes_list = (
+                pre_token_bytes_list[:best_idx] + [merged] + pre_token_bytes_list[best_idx + 2 :]
+            )
+        return [self.vocab_rank[token] for token in pre_token_bytes_list]
+
+    def encode(self, text: str) -> list[int]:
+        ids: list[int] = []
+        if self.special_tokens:
+            pattern = "(" + "|".join(re.escape(t) for t in self.special_tokens) + ")"
+            segments = re.split(pattern, text)
+        else:
+            segments = [text]
+
+        for segment in segments:
+            if segment in self._special_ids:
+                ids.append(self._special_ids[segment])
+            elif segment:
+                for pre_token in re.findall(GPT2_PAT, segment):
+                    if pre_token in self._special_ids:
+                        ids.append(self._special_ids[pre_token])
+                    else:
+                        ids.extend(self._merge_pre_token(pre_token))
+        return ids
+
+    def encode_line(self, line: str, *, append_eot: bool = True) -> list[int]:
+        line = line.strip()
+        if not line:
+            return [self.eot_id] if append_eot else []
+        ids = self.encode(line)
+        if append_eot:
+            ids.append(self.eot_id)
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        decoded_bytes = bytearray()
+        for token_id in ids:
+            if token_id in self.vocab:
+                decoded_bytes.extend(self.vocab[token_id])
+            else:
+                decoded_bytes.extend("\ufffd".encode("utf-8"))
+        return decoded_bytes.decode("utf-8", errors="replace")
+
+
+_MP_TOKENIZER: BPETokenizer | None = None
+
+
+def _tokenize_worker_init(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    special_tokens: list[str],
+) -> None:
+    global _MP_TOKENIZER
+    _MP_TOKENIZER = BPETokenizer(vocab, merges, special_tokens)
+
+
+def _encode_lines_batch(lines: list[str]) -> list[list[int]]:
+    assert _MP_TOKENIZER is not None
+    return [_MP_TOKENIZER.encode_line(line) for line in lines]
+
+
+def _count_lines_batch(lines: list[str]) -> int:
+    assert _MP_TOKENIZER is not None
+    return sum(len(_MP_TOKENIZER.encode_line(line)) for line in lines)
+
+
+def _resolve_num_workers(num_workers: int | None) -> int:
+    if num_workers is not None:
+        return max(1, num_workers)
+    return max(1, (os.cpu_count() or 1) - 1)
+
+
+def _split_for_workers(lines: list[str], workers: int) -> list[list[str]]:
+    if not lines:
+        return []
+    workers = min(workers, len(lines))
+    chunk = (len(lines) + workers - 1) // workers
+    return [lines[i : i + chunk] for i in range(0, len(lines), chunk)]
+
+
+def _iter_line_batches(path: Path, batch_size: int):
+    batch: list[str] = []
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            batch.append(line)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+
+def count_tokens_in_text_file(
+    txt_path: str | os.PathLike,
+    tokenizer: BPETokenizer,
+    num_workers: int | None = None,
+) -> int:
+    txt_path = Path(txt_path)
+    workers = _resolve_num_workers(num_workers)
+    line_batches = list(_iter_line_batches(txt_path, _LINE_BATCH_SIZE))
+    if workers <= 1:
+        return sum(len(tokenizer.encode_line(line)) for batch in line_batches for line in batch)
+
+    initargs = (tokenizer.vocab, tokenizer.merges, tokenizer.special_tokens)
+    total = 0
+    with ProcessPoolExecutor(max_workers=workers, initializer=_tokenize_worker_init, initargs=initargs) as pool:
+        for batch in line_batches:
+            for n in pool.map(_count_lines_batch, _split_for_workers(batch, workers)):
+                total += n
+    return total
+
+
+def tokenize_text_file_to_memmap(
+    txt_path: str | os.PathLike,
+    out_path: str | os.PathLike,
+    tokenizer: BPETokenizer,
+    num_workers: int | None = None,
+) -> int:
+    """Write uint16 memmap tokens for ``training_loop.load_memmap``."""
+    txt_path = Path(txt_path)
+    out_path = Path(out_path)
+    workers = _resolve_num_workers(num_workers)
+    if workers > 1:
+        print(f"  parallel tokenize with {workers} processes")
+
+    total = count_tokens_in_text_file(txt_path, tokenizer, num_workers=num_workers)
+    arr = np.memmap(out_path, dtype=np.uint16, mode="w+", shape=(total,))
+    idx = 0
+    line_batches = list(_iter_line_batches(txt_path, _LINE_BATCH_SIZE))
+
+    if workers <= 1:
+        for batch in line_batches:
+            for line in batch:
+                ids = tokenizer.encode_line(line)
+                n = len(ids)
+                if n:
+                    arr[idx : idx + n] = ids
+                    idx += n
+    else:
+        initargs = (tokenizer.vocab, tokenizer.merges, tokenizer.special_tokens)
+        with ProcessPoolExecutor(max_workers=workers, initializer=_tokenize_worker_init, initargs=initargs) as pool:
+            for batch in line_batches:
+                for encoded in pool.map(_encode_lines_batch, _split_for_workers(batch, workers)):
+                    for ids in encoded:
+                        n = len(ids)
+                        if n:
+                            arr[idx : idx + n] = ids
+                            idx += n
+
+    arr.flush()
+    return total
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Train BPE (bpe_tokenizer.py) and write uint16 memmaps.")
+    p.add_argument("--train-txt", type=Path, required=True, help="Text file to train BPE on")
+    p.add_argument("--corpus-txt", type=Path, action="append", help="Text file(s) to tokenize (default: train-txt)")
+    p.add_argument("--out-dir", type=Path, default=Path("data"))
+    p.add_argument("--vocab-size", type=int, default=10000)
+    p.add_argument("--special-token", action="append", default=["<|endoftext|>"])
+    p.add_argument("--vocab-out", type=Path, default=None, help="defaults to out-dir/vocab.json")
+    p.add_argument("--merges-out", type=Path, default=None, help="defaults to out-dir/merges.txt")
+    p.add_argument("--skip-train", action="store_true", help="load existing vocab/merges instead of training")
+    p.add_argument("--pretoken-num-workers", type=int, default=None, help="CPU processes for BPE pretokenize")
+    p.add_argument("--tokenize-num-workers", type=int, default=None, help="CPU processes for .txt -> .bin encode")
+    args = p.parse_args()
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    vocab_path = args.vocab_out or (args.out_dir / "vocab.json")
+    merges_path = args.merges_out or (args.out_dir / "merges.txt")
+
+    if args.skip_train:
+        if not vocab_path.is_file() or not merges_path.is_file():
+            raise FileNotFoundError(
+                f"missing {vocab_path} or {merges_path}. "
+                "Run without --skip-train first to train BPE and create them."
+            )
+        tokenizer = BPETokenizer.from_files(vocab_path, merges_path, args.special_token)
+        print(f"loaded tokenizer from {vocab_path} ({len(tokenizer.vocab)} tokens)")
+    else:
+        print(f"training BPE on {args.train_txt} (vocab_size={args.vocab_size}) ...")
+        vocab, merges = bpe_tokenizer_training(
+            str(args.train_txt),
+            args.vocab_size,
+            args.special_token,
+            pretoken_num_workers=args.pretoken_num_workers,
+        )
+        save_vocab_merges(vocab, merges, vocab_path, merges_path)
+        tokenizer = BPETokenizer(vocab, merges, args.special_token)
+        print(f"saved {vocab_path} and {merges_path} ({len(vocab)} tokens)")
+
+    corpus_files = args.corpus_txt or [args.train_txt]
+    for txt in corpus_files:
+        out = args.out_dir / f"{txt.stem}.bin"
+        print(f"tokenizing {txt} -> {out} ...")
+        n = tokenize_text_file_to_memmap(txt, out, tokenizer, num_workers=args.tokenize_num_workers)
+        print(f"  {n:,} tokens")
+
+
+if __name__ == "__main__":
+    main()

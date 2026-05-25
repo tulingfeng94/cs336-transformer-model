@@ -161,3 +161,9 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# assignment1-practice: too large for GitHub (>2 GiB push limit)
+assignment1-practice/checkpoints/
+assignment1-practice/data/*.bin
+assignment1-practice/data/TinyStories*.txt
+assignment1-practice/data/tokenize.log
