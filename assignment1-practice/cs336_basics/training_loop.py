@@ -6,22 +6,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-<<<<<<< HEAD
-
-from cs336_basics.bpe_tokenizer import BPETokenizer
+from pathlib import Path
 from cs336_basics.transformer import (
     AdamW,
+    CheckpointManager,
     CrossEntropyLoss,
     TransformerLM,
     get_batch,
     load_checkpoint,
-    save_checkpoint,
 )
-
-=======
-from pathlib import Path
-from cs336_basics.transformer import AdamW, load_checkpoint, save_checkpoint, build_transformer_lm, CrossEntropyLoss, get_batch
->>>>>>> 52171c4 (Assignment2 systems: DDP, FSDP, benchmarks)
 # ── arg parsing ────────────────────────────────────────────────────────────────
 
 
@@ -65,6 +58,7 @@ def parse_args():
     p.add_argument("--val-interval", type=int, default=500)
     p.add_argument("--val-steps", type=int, default=20)
     p.add_argument("--ckpt-interval", type=int, default=1000)
+    p.add_argument("--max-checkpoints", type=int, default=5, help="max async checkpoints to keep on disk")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--wandb", action="store_true")
@@ -203,44 +197,58 @@ def main():
         start_step = load_checkpoint(args.resume, model, optimizer)
         print(f"resumed from step {start_step}")
 
+    ckpt_manager = CheckpointManager(max_to_keep=args.max_checkpoints)
     t0 = time.time()
-    for step in range(start_step, args.max_steps):
-        lr = get_lr(step, args.max_steps, args.lr)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+    loss = None
+    try:
+        for step in range(start_step, args.max_steps):
+            lr = get_lr(step, args.max_steps, args.lr)
+            for g in optimizer.param_groups:
+                g["lr"] = lr
 
-        inputs, targets = get_batch(train_data, args.batch_size, args.context_length, args.device)
+            inputs, targets = get_batch(train_data, args.batch_size, args.context_length, args.device)
 
-        logits = model(inputs)
-        loss = CrossEntropyLoss(logits.view(-1, args.vocab_size), targets.view(-1))
+            logits = model(inputs)
+            loss = CrossEntropyLoss(logits.view(-1, args.vocab_size), targets.view(-1))
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
 
-        if step % args.log_interval == 0:
-            dt = time.time() - t0
-            print(f"step {step:6d} | loss {loss.item():.4f} | lr {lr:.2e} | {dt:.1f}s")
-            if args.wandb:
-                wandb.log({"train/loss": loss.item(), "train/lr": lr}, step=step)
-            t0 = time.time()
+            if step % args.log_interval == 0:
+                dt = time.time() - t0
+                print(f"step {step:6d} | loss {loss.item():.4f} | lr {lr:.2e} | {dt:.1f}s")
+                if args.wandb:
+                    wandb.log({"train/loss": loss.item(), "train/lr": lr}, step=step)
+                t0 = time.time()
 
-        if step % args.val_interval == 0:
-            val_loss = evaluate(model, val_data, args)
-            print(f"  val loss {val_loss:.4f} | ppl {np.exp(val_loss):.2f}")
-            if args.wandb:
-                wandb.log({"val/loss": val_loss, "val/ppl": np.exp(val_loss)}, step=step)
+            if step % args.val_interval == 0:
+                val_loss = evaluate(model, val_data, args)
+                print(f"  val loss {val_loss:.4f} | ppl {np.exp(val_loss):.2f}")
+                if args.wandb:
+                    wandb.log({"val/loss": val_loss, "val/ppl": np.exp(val_loss)}, step=step)
 
-        if step % args.ckpt_interval == 0 and step > 0:
-            save_checkpoint(
-                f"{args.out_dir}/ckpt_{step:06d}.pt",
+            if step % args.ckpt_interval == 0 and step > 0:
+                ckpt_manager.save_checkpoint_async(
+                    f"{args.out_dir}/ckpt_{step:06d}.pt",
+                    model,
+                    optimizer,
+                    step,
+                    loss.item(),
+                )
+
+        if loss is not None:
+            ckpt_manager.save_checkpoint_async(
+                f"{args.out_dir}/ckpt_final.pt",
                 model,
                 optimizer,
-                step,
+                args.max_steps - 1,
+                loss.item(),
             )
-
-    save_checkpoint(f"{args.out_dir}/ckpt_final.pt", model, optimizer, args.max_steps)
+    finally:
+        ckpt_manager.wait_pending()
+        ckpt_manager.shutdown()
 
 
 if __name__ == "__main__":

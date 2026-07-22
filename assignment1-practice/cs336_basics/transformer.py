@@ -7,6 +7,8 @@ import numpy as np
 import numpy.typing as npt
 import torch
 import torch.nn as nn
+import threading
+import queue
 
 from torch.optim import Optimizer
 
@@ -401,18 +403,62 @@ def load_checkpoint(
     checkpoint = torch.load(src)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint["iteration"]
+    return checkpoint["iteration"], checkpoint["loss"]
 
 def save_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    loss: torch.Tensor,
     iteration: int,
 ) -> None:
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "loss": loss,
         "iteration": iteration,
     }
     torch.save(checkpoint, src)
+
+class CheckpointManager:
+    def __int__ (self, checkpoint_dir: str, max_to_keep: int = 5):
+        self.checkpoint_dir = checkpoint_dir
+        self.max_to_keep = max_to_keep
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        self._saved_paths = []
+
+    def save_checkpoint_async(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss: torch.Tensor, iteration: int):
+        checkpoint_state = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": loss,
+            "iteration": iteration,
+        }
+        self._queue.put(checkpoint_state, self.checkpoint_dir)
+
+    def _worker(self):
+        while True:
+            checkpoint_state, checkpoint_dir = self._queue.get()
+            if checkpoint_state is None:
+                break
+            tmp = checkpoint_dir + ".tmp"
+            torch.save(checkpoint_state, tmp)
+            os.rename(tmp, checkpoint_dir)
+            self._saved_paths.append(checkpoint_dir)
+            self._cleanup()
+            self._queue.task_done()
+
+    def _cleanup(self):
+        if len(self._saved_paths) > self.max_to_keep:
+            legacy = self._saved_paths.pop[0]
+            if os.path.exists(legacy):
+                os.remove(legacy)
     
+    def wait_pending(self):
+        self._queue.join()
+
+    def shutdown(self):
+        self._queue.put(None)
+        self._thread.join()
